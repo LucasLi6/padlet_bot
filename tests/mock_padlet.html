@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Mock Padlet Board</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 16px; }
+  header { display: flex; justify-content: flex-end; }
+  #guest { width: 40px; height: 40px; border-radius: 50%; padding: 0; border: 0; }
+  #guest img { width: 40px; height: 40px; border-radius: 50%; }
+  #menu { position: absolute; right: 16px; top: 64px; background: #fff;
+          border: 1px solid #ccc; padding: 4px; }
+  #board { display: flex; gap: 24px; margin-top: 24px; }
+  section { flex: 1; border: 1px solid #ddd; border-radius: 8px; padding: 12px;
+            min-height: 240px; }
+  section h2 { margin: 0 0 8px; font-size: 18px; }
+  .add { font-size: 20px; width: 32px; height: 32px; cursor: pointer; }
+  .posts { margin-top: 12px; display: flex; flex-wrap: wrap; gap: 8px; }
+  article img { width: 120px; height: 90px; object-fit: cover; display: block; }
+  #nameDialog, #composer { position: fixed; inset: 10% 25%; background: #fff;
+                 border: 1px solid #888; border-radius: 10px; padding: 16px;
+                 box-shadow: 0 8px 30px rgba(0,0,0,.2); }
+  textarea { width: 100%; height: 60px; }
+  #preview { width: 300px; height: 200px; object-fit: cover; display: block; margin: 8px 0; }
+</style>
+</head>
+<body>
+<header>
+  <button id="guest" aria-label="Go to sign up page" data-alias="Daydream Architect">
+    <img class="relative z-10 rounded-full"
+         src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" alt="">
+  </button>
+  <div id="menu" hidden><button id="change">Change name</button></div>
+</header>
+
+<main id="board">
+  <section>
+    <h2>Section 1</h2>
+    <button class="add" aria-label="Add post to this section">+</button>
+    <div class="posts"></div>
+  </section>
+  <section>
+    <h2>Section 2</h2>
+    <button class="add" aria-label="Add post to this section">+</button>
+    <div class="posts"></div>
+  </section>
+</main>
+
+<div id="nameDialog" hidden>
+  <h3>Your name</h3>
+  <input id="nameInput" type="text">
+  <button id="done">Done</button>
+</div>
+
+<div id="composer" hidden>
+  <textarea aria-label="Post subject" placeholder="Subject"></textarea>
+  <div role="textbox" aria-label="Post body" contenteditable="true"></div>
+  <button id="upload" aria-label="Upload">Upload</button>
+  <input id="fileInput" type="file" accept="image/*" hidden>
+  <img id="preview" alt="" hidden>
+  <div>
+    <button id="closePost" aria-label="Close post">Close</button>
+    <button id="submit" aria-label="Submit post">Submit</button>
+  </div>
+</div>
+
+<script>
+  const guest = document.getElementById('guest');
+  const menu = document.getElementById('menu');
+  const nameDialog = document.getElementById('nameDialog');
+  const nameInput = document.getElementById('nameInput');
+  const composer = document.getElementById('composer');
+  const preview = document.getElementById('preview');
+  const fileInput = document.getElementById('fileInput');
+  let alias = guest.dataset.alias;
+  let currentSection = null;
+
+  guest.addEventListener('click', () => { menu.hidden = !menu.hidden; });
+
+  document.getElementById('change').addEventListener('click', () => {
+    menu.hidden = true;
+    nameInput.value = alias;
+    nameDialog.hidden = false;
+  });
+
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape') {
+      nameDialog.hidden = true;
+      menu.hidden = true;
+      composer.hidden = true;
+    }
+  });
+
+  document.getElementById('done').addEventListener('click', () => {
+    alias = nameInput.value.trim() || alias;
+    guest.dataset.alias = alias;
+    nameDialog.hidden = true;
+  });
+
+  for (const btn of document.querySelectorAll('.add')) {
+    btn.addEventListener('click', () => {
+      currentSection = btn.closest('section');
+      preview.hidden = true;
+      preview.removeAttribute('src');
+      document.querySelector('#composer textarea').value = '';
+      composer.hidden = false;
+    });
+  }
+
+  document.getElementById('upload').addEventListener('click', () => fileInput.click());
+
+  fileInput.addEventListener('change', () => {
+    const file = fileInput.files && fileInput.files[0];
+    if (!file) return;
+    if (location.search.includes('upload_error')) {
+      let err = document.getElementById('uploadErr');
+      if (!err) {
+        err = document.createElement('div');
+        err.id = 'uploadErr';
+        err.textContent = "Sorry, there's a error when uploading the file";
+        composer.appendChild(err);
+        setTimeout(() => err.remove(), 2500);
+      }
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      preview.src = reader.result;
+      preview.hidden = false;
+    };
+    reader.readAsDataURL(file);
+  });
+
+  document.getElementById('closePost').addEventListener('click', () => {
+    composer.hidden = true;
+    fileInput.value = '';
+  });
+
+  document.getElementById('submit').addEventListener('click', () => {
+    if (currentSection && preview.src) {
+      const card = document.createElement('article');
+      const img = document.createElement('img');
+      img.src = preview.src;
+      card.appendChild(img);
+      currentSection.querySelector('.posts').appendChild(card);
+    }
+    composer.hidden = true;
+    fileInput.value = '';
+  });
+</script>
+</body>
+</html>

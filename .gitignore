@@ -1,0 +1,17 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local run output (logs, screenshots, CSVs contain board URLs and images)
+logs/
+
+# Local images are personal; keep the folder but not its contents
+images/*
+!images/.gitkeep
+
+# Per-user selector overrides
+selectors.json
+
+.DS_Store
