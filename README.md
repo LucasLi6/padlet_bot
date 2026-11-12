@@ -162,7 +162,7 @@ Reason: ...
 | 菜单项 | 按钮文字 `Change name` | 已验证 |
 | 昵称输入 | `input[type=text]`（对话框内） | 已验证 |
 | 昵称保存 | 按钮 `Done` | 已验证 |
-| 昵称回读验证 | 重新打开 `Change name` 读取输入框 | 已验证（保存后回读为 `TestBot`） |
+| 昵称回读验证 | 重新打开 `Change name` 读取输入框 | 已验证（保存后回读与设置值一致） |
 | Column | `button[aria-label="Add post to this section"]` | 已验证（4 个 Section） |
 | 主题框 | `textarea[aria-label="Post subject"]` | 已验证 |
 | 正文框 | `[role=textbox][aria-label="Post body"]` | 已验证 |
