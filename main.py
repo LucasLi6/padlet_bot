@@ -204,13 +204,20 @@ class StopRun(Exception):
 
 @dataclass
 class BrowserSession:
-    """A launched browser plus the page to drive, and how to close both."""
+    """A launched browser plus the page to drive, and how to close both.
+
+    ``owned=False`` means the browser was started by the user (CDP attach):
+    closing it would kill their window, so only the connection is dropped.
+    """
 
     context: Any
     page: Page
     browser: Any = None
+    owned: bool = True
 
     def close(self) -> None:
+        if not self.owned:
+            return
         try:
             self.context.close()
         except PWError:
@@ -222,18 +229,80 @@ class BrowserSession:
                 pass
 
 
+def _same_board(a: Optional[str], b: str) -> bool:
+    """True when two URLs point at the same board (query/fragment ignored)."""
+    if not a:
+        return False
+    pa, pb = urlparse(a), urlparse(b)
+    return pa.netloc.lower() == pb.netloc.lower() and pa.path.rstrip("/") == pb.path.rstrip("/")
+
+
+def _pick_cdp_page(context: Any, url: str) -> Page:
+    """Pick the user's already-open board tab, or the first Padlet tab."""
+    pages = list(context.pages)
+    for page in pages:
+        try:
+            if _same_board(page.url, url):
+                return page
+        except PWError:
+            continue
+    for page in pages:
+        try:
+            if "padlet.com" in (page.url or ""):
+                return page
+        except PWError:
+            continue
+    if pages:
+        return pages[0]
+    return context.new_page()
+
+
+def connect_browser(pw: Any, cdp_url: str, url: str) -> BrowserSession:
+    """Attach to a Chrome the user started with --remote-debugging-port.
+
+    This is the recommended mode when a human-verification challenge appears:
+    the user opens Padlet and clears the check in that window, and the script
+    drives the same tab. The browser is never closed by the script.
+    """
+    try:
+        browser = pw.chromium.connect_over_cdp(cdp_url)
+    except PWError as exc:
+        raise BotError(
+            f"Could not connect to Chrome at {cdp_url}: {exc}. Start it first with: "
+            '"<path to Google Chrome>" --remote-debugging-port=9222 '
+            '--user-data-dir="$HOME/chrome-padlet-debug"'
+        ) from exc
+    if not browser.contexts:
+        raise BotError(
+            f"Connected to {cdp_url}, but it has no browser context/page. "
+            "Open a Chrome window (not just the debug port) and try again."
+        )
+    context = browser.contexts[0]
+    page = _pick_cdp_page(context, url)
+    logging.info("Attached via CDP to %s; using tab: %s", cdp_url, page.url)
+    return BrowserSession(context=context, page=page, browser=browser, owned=False)
+
+
 def launch_browser(
     pw: Any,
     headless: bool,
     profile_dir: Optional[Path] = CHROME_PROFILE_DIR,
+    cdp_url: Optional[str] = None,
+    url: str = "",
 ) -> BrowserSession:
-    """Launch Google Chrome with a persistent profile (default).
+    """Launch Google Chrome with a persistent profile, or attach over CDP.
 
     ``channel="chrome"`` uses the Google Chrome installed on this machine, not
     Playwright's bundled Chromium. ``user_data_dir`` persists cookies and any
     completed Cloudflare/security check between runs. Pass ``profile_dir=None``
     to use bundled Chromium (the test suite does this to stay isolated).
+
+    When ``cdp_url`` is given, the user's already-running Chrome is used and is
+    left open when the run ends.
     """
+    if cdp_url:
+        return connect_browser(pw, cdp_url, url)
+
     if profile_dir is not None:
         profile = Path(profile_dir).resolve()
         profile.mkdir(parents=True, exist_ok=True)
@@ -1403,6 +1472,7 @@ def diagnose_upload(
     timeout_s: float = 90.0,
     profile_dir: Optional[Path] = CHROME_PROFILE_DIR,
     security_timeout_ms: int = SECURITY_WAIT_MS,
+    cdp_url: Optional[str] = None,
 ) -> int:
     """Single-attempt upload diagnostic. Never publishes and never retries.
 
@@ -1435,11 +1505,12 @@ def diagnose_upload(
     history: list[tuple[str, str]] = []
 
     with sync_playwright() as pw:
-        session = launch_browser(pw, headless, profile_dir)
+        session = launch_browser(pw, headless, profile_dir, cdp_url, url)
         page = session.page
         monitor = NetworkMonitor(page, net_path)
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+            if not (cdp_url and _same_board(page.url, url)):
+                page.goto(url, wait_until="domcontentloaded", timeout=60_000)
             wait_for_board(page, selectors, security_timeout_ms=security_timeout_ms)
             check_not_logged_in(page, selectors)
             column = random.choice(get_columns(page, selectors))
@@ -1767,6 +1838,7 @@ def run(
     diagnose_only: bool = False,
     profile_dir: Optional[Path] = CHROME_PROFILE_DIR,
     security_timeout_ms: int = SECURITY_WAIT_MS,
+    cdp_url: Optional[str] = None,
 ) -> Stats:
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     selectors = load_selectors()
@@ -1781,13 +1853,14 @@ def run(
     run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     with sync_playwright() as p:
-        session = launch_browser(p, headless, profile_dir)
+        session = launch_browser(p, headless, profile_dir, cdp_url, url)
         page = session.page
         monitor = NetworkMonitor(page, LOGS_DIR / f"upload_network_{run_stamp}.jsonl")
         logging.info("Upload network log: %s", monitor.path)
 
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+            if not (cdp_url and _same_board(page.url, url)):
+                page.goto(url, wait_until="domcontentloaded", timeout=60_000)
             wait_for_board(page, selectors, security_timeout_ms=security_timeout_ms)
 
             if diagnose_only:
@@ -1941,6 +2014,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     parser.add_argument("--interval", type=float, default=MIN_INTERVAL_S, help="Seconds between posts")
     parser.add_argument(
+        "--cdp-url",
+        help=(
+            "Attach to a Chrome you started with --remote-debugging-port, e.g. "
+            "http://127.0.0.1:9222. Use the already-open tab; never closes the browser"
+        ),
+    )
+    parser.add_argument(
         "--security-timeout",
         type=float,
         default=0.0,
@@ -1963,6 +2043,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 headless=args.headless,
                 timeout_s=args.upload_timeout,
                 security_timeout_ms=security_timeout_ms,
+                cdp_url=args.cdp_url,
             )
         except StopRun as exc:
             logging.error("Stopped: %s", exc)
@@ -1997,6 +2078,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             interval=args.interval,
             diagnose_only=args.diagnose,
             security_timeout_ms=security_timeout_ms,
+            cdp_url=args.cdp_url,
         )
     except StopRun as exc:
         logging.error("Stopped: %s", exc)

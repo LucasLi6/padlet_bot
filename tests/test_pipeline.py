@@ -210,6 +210,85 @@ def test_security_check_waits_for_the_user(monkeypatch, tmp_path):
     assert calls["waits"] == 1
 
 
+# --------------------------------------------------------------------------- #
+# CDP attach: drive the browser the user already opened
+# --------------------------------------------------------------------------- #
+
+
+class _FakeTab:
+    def __init__(self, url):
+        self.url = url
+
+
+class _FakeContext:
+    def __init__(self, pages):
+        self.pages = pages
+        self.closed = False
+        self.created = 0
+
+    def new_page(self):
+        self.created += 1
+        tab = _FakeTab("about:blank")
+        self.pages.append(tab)
+        return tab
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeCdpBrowser:
+    def __init__(self, context):
+        self.contexts = [context]
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeCdpPlaywright:
+    def __init__(self, browser):
+        self.chromium = self
+        self._browser = browser
+
+    def connect_over_cdp(self, url):
+        assert url == "http://127.0.0.1:9222"
+        return self._browser
+
+
+def test_same_board_ignores_query_and_fragment():
+    board = "https://padlet.com/example-user/test-board"
+    assert main._same_board(board + "?share=1", board)
+    assert main._same_board(board + "/#x", board)
+    assert not main._same_board("https://padlet.com/other/board", board)
+
+
+def test_pick_cdp_page_prefers_the_open_board_tab():
+    board = "https://padlet.com/example-user/test-board"
+    ctx = _FakeContext(
+        [_FakeTab("https://padlet.com/example-user/other"), _FakeTab(board), _FakeTab("about:blank")]
+    )
+    assert main._pick_cdp_page(ctx, board).url == board
+
+
+def test_pick_cdp_page_falls_back_to_any_padlet_tab():
+    ctx = _FakeContext([_FakeTab("https://example.com"), _FakeTab("https://padlet.com/home")])
+    assert main._pick_cdp_page(ctx, "https://padlet.com/example-user/test-board").url == (
+        "https://padlet.com/home"
+    )
+
+
+def test_cdp_session_never_closes_the_users_browser():
+    board = "https://padlet.com/example-user/test-board"
+    ctx = _FakeContext([_FakeTab(board)])
+    browser = _FakeCdpBrowser(ctx)
+    session = main.connect_browser(_FakeCdpPlaywright(browser), "http://127.0.0.1:9222", board)
+    assert session.owned is False
+    assert session.page.url == board
+    session.close()
+    assert ctx.closed is False
+    assert browser.closed is False
+
+
 def test_uncertain_stops_without_resubmitting(run_env, monkeypatch):
     """If a publish cannot be confirmed, the run stops instead of retrying."""
 

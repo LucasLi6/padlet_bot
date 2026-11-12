@@ -49,7 +49,41 @@ python3 -m venv .venv
 | `--upload-timeout` | 诊断时观察一次上传的秒数（默认 90；超时记 `UNKNOWN`） |
 | `--interval` | 帖子间隔秒数（最低 5 秒） |
 | `--security-timeout` | 安全验证最多等你多少秒（默认 `0`＝一直等，窗口保持打开） |
+| `--cdp-url` | 连接你手动启动的 Chrome（如 `http://127.0.0.1:9222`），直接操作你已打开的页面；脚本不会关闭该浏览器 |
 | `--verbose` | 调试日志 |
+
+## 接管你已经打开的 Chrome（人机验证不通过时用这个）
+
+Padlet 的 Cloudflare 校验有时会拒绝 Playwright 自己启动的浏览器。更稳的方式是：**你自己启动 Chrome 并完成验证，脚本再通过 CDP 连接到这个已经打开的窗口**。
+
+### 1. 手动启动带调试端口的 Chrome
+
+```bash
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+  --remote-debugging-address=127.0.0.1 \
+  --remote-debugging-port=9222 \
+  --user-data-dir="$HOME/chrome-padlet-debug"
+```
+
+在这个窗口里打开你的 Padlet 板，登录 / 完成人机验证，确认页面能正常操作。注意：Chrome 136+ 要求远程调试使用独立的数据目录，不能指向你日常使用的默认个人资料。
+
+### 2. 让脚本连接这个窗口
+
+```bash
+.venv/bin/python main.py \
+  --url "https://padlet.com/<your-workspace>/<your-board-id>" \
+  --count 5 \
+  --cdp-url http://127.0.0.1:9222
+```
+
+脚本会：
+
+- 连接 `127.0.0.1:9222`，优先选中**已经打开的目标板标签页**（没有就选任意 Padlet 标签页）；
+- 如果该标签页已经是目标板，**不会重新导航**，保留你已经通过的验证状态；
+- 之后的昵称设置、上传、发布都在这个窗口里完成；
+- 运行结束只断开连接，**不关闭你的 Chrome**。
+
+如果验证又出现，脚本仍会暂停等你完成（见上一节），不会关窗口。
 
 ## 目录
 
@@ -186,7 +220,7 @@ Reason: ...
 .venv/bin/pytest -q
 ```
 
-测试用本地 mock 板跑通完整流程（列发现、昵称设置、图片上传、发布、校验、dry-run、安全停止、uncertain 停止），**不触及 padlet.com**。共 25 个测试。
+测试用本地 mock 板跑通完整流程（列发现、昵称设置、图片上传、发布、校验、dry-run、安全停止、uncertain 停止），**不触及 padlet.com**。共 29 个测试。
 
 ## 已验证 / 未验证
 
@@ -197,8 +231,9 @@ Reason: ...
 - 打开编辑器、通过 Upload 的文件选择器上传图片、预览渲染
 - 关闭编辑器（dry-run 不提交）
 - **真实站点发布 1 条**（Section 2，作者 `TestBot`），并以「目标 Section 内出现昵称 + 图片」判据回读为 `True`
-- 本地 mock 板上的完整发布与校验流程，以及上传诊断的网络脱敏 / 4xx-vs-requestfailed / 状态机测试（25 个测试）
+- 本地 mock 板上的完整发布与校验流程，以及上传诊断的网络脱敏 / 4xx-vs-requestfailed / 状态机测试（29 个测试）
 - 安全验证暂停逻辑：验证窗口出现时脚本保持等待，验证消失后自动继续（`test_security_check_waits_for_the_user`）
+- CDP 接管：优先选中已打开的目标板标签页，且脚本结束时不会关闭用户的浏览器（4 个测试）
 
 实现中修正的一个真实问题：首次真实发布时，React 重建 DOM 丢弃了临时标记，且发布后的图片 URL 与预览 URL 不同，曾导致误报 `uncertain`（脚本按设计停止、未重复提交）。现已改为按 Section 标题 + 昵称 + 图片定位，并在每次发帖前重新扫描 Column。
 
