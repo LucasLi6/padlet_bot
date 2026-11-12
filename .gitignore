@@ -11,6 +11,9 @@ logs/
 images/*
 !images/.gitkeep
 
+# Per-user Chrome profile (cookies, Cloudflare clearance — never commit)
+chrome_profile/
+
 # Per-user selector overrides
 selectors.json
 

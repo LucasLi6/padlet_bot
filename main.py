@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 from playwright.sync_api import (
     Error as PWError,
@@ -58,11 +59,18 @@ IMAGES_DIR = ROOT / "images"
 NAMES_FILE = ROOT / "names.txt"
 LOGS_DIR = ROOT / "logs"
 SELECTORS_FILE = ROOT / "selectors.json"
+# Dedicated Chrome profile (cookies + Cloudflare clearance). Never reuse the
+# user's daily Chrome profile: Playwright warns it can break browser startup.
+CHROME_PROFILE_DIR = ROOT / "chrome_profile"
 
 SUPPORTED_IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp"}
 DEFAULT_ALIAS = "TestBot"
 MIN_INTERVAL_S = 5.0
 CONFIRM_THRESHOLD = 20
+
+# How long to wait for a human to clear a security check. 0 = wait forever
+# (the run stays paused and the browser window stays open). Tests override it.
+SECURITY_WAIT_MS = 0
 
 STATUS_PUBLISHED = "published"
 STATUS_PENDING = "pending_moderation"
@@ -135,7 +143,14 @@ DEFAULT_SELECTORS: dict[str, list[dict[str, Any]]] = {
         {"kind": "text", "value": r"(something went wrong|failed to|could not|not allowed|try again|error)"},
     ],
     "upload_error_text": [
-        {"kind": "text", "value": r"(error (when |while )?uploading|failed to upload|couldn'?t upload|could not upload|sorry,? there.?s an? error)"},
+        {
+            "kind": "text",
+            "value": (
+                r"(error (when |while )?uploading|failed to upload|couldn'?t upload"
+                r"|could not upload|picture loading fail(ed)?|failed to load (the )?(picture|image)"
+                r"|image (processing|upload) (failed|error)|sorry,? there.?s an? error)"
+            ),
+        },
     ],
     "security_text": [
         {"kind": "text", "value": r"(security check|verify you are human|just a moment|are you a robot|access denied)"},
@@ -176,11 +191,69 @@ class SelectorError(BotError):
 
 
 class UploadError(BotError):
-    """Padlet displayed an upload-failure message in the composer."""
+    """Upload failed. ``retryable`` says whether another attempt can help."""
+
+    def __init__(self, message: str, retryable: bool = True) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 class StopRun(Exception):
     """A condition that must abort the whole run (captcha, rate limit, ...)."""
+
+
+@dataclass
+class BrowserSession:
+    """A launched browser plus the page to drive, and how to close both."""
+
+    context: Any
+    page: Page
+    browser: Any = None
+
+    def close(self) -> None:
+        try:
+            self.context.close()
+        except PWError:
+            pass
+        if self.browser is not None:
+            try:
+                self.browser.close()
+            except PWError:
+                pass
+
+
+def launch_browser(
+    pw: Any,
+    headless: bool,
+    profile_dir: Optional[Path] = CHROME_PROFILE_DIR,
+) -> BrowserSession:
+    """Launch Google Chrome with a persistent profile (default).
+
+    ``channel="chrome"`` uses the Google Chrome installed on this machine, not
+    Playwright's bundled Chromium. ``user_data_dir`` persists cookies and any
+    completed Cloudflare/security check between runs. Pass ``profile_dir=None``
+    to use bundled Chromium (the test suite does this to stay isolated).
+    """
+    if profile_dir is not None:
+        profile = Path(profile_dir).resolve()
+        profile.mkdir(parents=True, exist_ok=True)
+        try:
+            context = pw.chromium.launch_persistent_context(
+                user_data_dir=str(profile),
+                channel="chrome",
+                headless=headless,
+            )
+        except PWError as exc:
+            raise BotError(
+                f"Could not launch Google Chrome with profile {profile}: {exc}. "
+                "Close other windows using that profile, or run without --chrome-profile."
+            ) from exc
+        page = context.pages[0] if context.pages else context.new_page()
+        return BrowserSession(context=context, page=page)
+
+    browser = pw.chromium.launch(headless=headless)
+    context = browser.new_context()
+    return BrowserSession(context=context, page=context.new_page(), browser=browser)
 
 
 # --------------------------------------------------------------------------- #
@@ -295,15 +368,59 @@ def exists(page: Page, key: str, selectors: dict[str, list[dict[str, Any]]], roo
 # --------------------------------------------------------------------------- #
 
 
-def wait_for_board(page: Page, selectors: dict[str, list[dict[str, Any]]], timeout_ms: int = 30_000) -> None:
-    """Wait until the board UI is interactive, aborting on security walls."""
+def wait_out_security_check(
+    page: Page,
+    selectors: dict[str, list[dict[str, Any]]],
+    timeout_ms: int = SECURITY_WAIT_MS,
+    label: str = "board",
+) -> None:
+    """Pause automation until a visible security check has been cleared.
+
+    The browser window stays open the whole time so the user can complete the
+    check by hand. ``timeout_ms=0`` (the default) waits indefinitely.
+    """
+    if _first_visible(page, selectors["security_text"]) is None:
+        return
+
+    logging.warning("Security check detected (%s); waiting for manual completion.", label)
+    print()
+    print("=" * 70)
+    print("检测到安全验证（Cloudflare / captcha）。")
+    print("请在浏览器窗口中手动完成验证；脚本会暂停等待，完成后自动继续。")
+    print("请不要关闭窗口。")
+    print("=" * 70, flush=True)
+
+    started = time.monotonic()
+    while True:
+        try:
+            page.wait_for_timeout(1000)
+        except PWError as exc:
+            raise BotError(
+                f"Browser was closed while waiting for the security check: {exc}"
+            ) from exc
+        if _first_visible(page, selectors["security_text"]) is None:
+            logging.info("Security check cleared; continuing.")
+            print("安全验证已通过，继续执行。", flush=True)
+            return
+        if timeout_ms and (time.monotonic() - started) * 1000 >= timeout_ms:
+            raise StopRun(
+                f"Security check was not completed within {timeout_ms // 1000}s; stopping."
+            )
+
+
+def wait_for_board(
+    page: Page,
+    selectors: dict[str, list[dict[str, Any]]],
+    timeout_ms: int = 30_000,
+    security_timeout_ms: int = SECURITY_WAIT_MS,
+) -> None:
+    """Wait until the board UI is interactive; pause while a human clears a check."""
     deadline = time.monotonic() + timeout_ms / 1000
     while time.monotonic() < deadline:
         if exists(page, "security_text", selectors):
-            raise StopRun(
-                "Padlet returned a security check / captcha. Automation stopped; "
-                "complete the check manually and rerun."
-            )
+            wait_out_security_check(page, selectors, security_timeout_ms, label="board load")
+            # Give the board its full startup window after the check clears.
+            deadline = time.monotonic() + timeout_ms / 1000
         if exists(page, "guest_avatar", selectors) or _add_buttons_present(page):
             return
         page.wait_for_timeout(300)
@@ -443,20 +560,31 @@ class Column:
 
 
 def get_columns(page: Page, selectors: dict[str, list[dict[str, Any]]]) -> list[Column]:
-    """Tag and return every column that has a usable add-post button."""
-    infos = _scan_add_buttons(page)
-    columns: list[Column] = []
-    for info in infos:
-        idx = info["index"]
-        add_button = page.locator(f'[data-pb-add="{idx}"]')
-        if add_button.count() == 0 or not add_button.first.is_visible():
-            continue
-        container = page.locator(f'[data-pb-col="{idx}"]')
-        container_loc = container.first if container.count() else None
-        col = Column(index=idx, title=info["title"], add_button=add_button.first, container=container_loc)
-        if container_loc is not None:
-            col.baseline_posts = _count_posts(container_loc, selectors)
-        columns.append(col)
+    """Tag and return every column that has a usable add-post button.
+
+    Sections render asynchronously after the board shell, so poll briefly
+    instead of failing on the first scan -- otherwise a run can start before
+    the first column exists.
+    """
+    deadline = time.monotonic() + 10
+    while True:
+        infos = _scan_add_buttons(page)
+        columns: list[Column] = []
+        for info in infos:
+            idx = info["index"]
+            add_button = page.locator(f'[data-pb-add="{idx}"]')
+            if add_button.count() == 0 or not add_button.first.is_visible():
+                continue
+            container = page.locator(f'[data-pb-col="{idx}"]')
+            container_loc = container.first if container.count() else None
+            col = Column(index=idx, title=info["title"], add_button=add_button.first, container=container_loc)
+            if container_loc is not None:
+                col.baseline_posts = _count_posts(container_loc, selectors)
+            columns.append(col)
+
+        if columns or time.monotonic() >= deadline:
+            break
+        page.wait_for_timeout(300)
 
     if not columns:
         raise SelectorError(
@@ -515,14 +643,22 @@ def _attach_file(page: Page, composer: Locator, image_path: Path, selectors: dic
         direct.set_input_files(str(image_path))
 
 
-def upload_image(page: Page, image_path: Path, selectors: dict[str, list[dict[str, Any]]]) -> Optional[str]:
+def upload_image(
+    page: Page,
+    image_path: Path,
+    selectors: dict[str, list[dict[str, Any]]],
+    monitor: Optional["NetworkMonitor"] = None,
+    security_timeout_ms: int = SECURITY_WAIT_MS,
+) -> Optional[str]:
     """Attach ``image_path``; return the preview src.
 
-    A transient Padlet upload error (the "error when uploading" toast) is retried
-    once. Nothing has been submitted at this point, so retrying cannot duplicate a
-    post. Timeouts are *not* retried, to avoid attaching the file twice.
+    With a network monitor, success requires the bytes transfer *and* Padlet's
+    post-processing request to succeed, and the result is read from the network,
+    not just from the presence of a preview. Retryable failures are retried (up
+    to 3 attempts); HTTP 401/403/429 stops the run instead of retrying.
     """
     last_error: Optional[Exception] = None
+    attempts = 0
     for attempt in range(1, 4):
         if attempt > 1:
             # A failed attempt leaves its toast on screen. Clear it first, otherwise
@@ -531,13 +667,32 @@ def upload_image(page: Page, image_path: Path, selectors: dict[str, list[dict[st
             _wait_upload_error_gone(page, selectors)
             page.wait_for_timeout(2000 * (attempt - 1))
         composer = resolve(page, "composer", selectors, timeout_ms=8_000)
+        if monitor is not None:
+            monitor.reset_upload_tracking()
+        attempts = attempt
         try:
             _attach_file(page, composer, image_path, selectors)
-            return wait_upload_complete(page, composer, image_path, selectors)
+            return wait_upload_complete(
+                page, composer, image_path, selectors, monitor=monitor,
+                security_timeout_ms=security_timeout_ms,
+            )
         except UploadError as exc:
             last_error = exc
             logging.warning("Upload attempt %d/3 failed: %s", attempt, exc)
-    raise BotError(f"Upload failed after 3 attempts: {last_error}")
+            if not exc.retryable:
+                break
+    raise BotError(f"Upload failed after {attempts} attempt(s): {last_error}")
+
+
+def _raise_for_upload_status(stage: str, status: Any) -> None:
+    """Turn a network outcome into the right exception class."""
+    if isinstance(status, int) and status in (401, 403, 429):
+        raise StopRun(
+            f"Padlet refused the {stage} request with HTTP {status}. "
+            "Stopping; not retrying or bypassing the restriction."
+        )
+    retryable = not isinstance(status, int) or status >= 500 or status in (408, 409, 425)
+    raise UploadError(f"{stage} failed: {status}", retryable=retryable)
 
 
 def _wait_upload_error_gone(page: Page, selectors: dict[str, list[dict[str, Any]]], timeout_ms: int = 10_000) -> None:
@@ -567,19 +722,147 @@ _UPLOADING_JS = r"""
 """
 
 
+def _announce_challenge(stage: str) -> None:
+    """Tell the user a Cloudflare challenge is blocking us and we are waiting."""
+    logging.warning("Cloudflare challenge on the %s request; pausing for manual completion.", stage)
+    print()
+    print("!" * 70)
+    print("Cloudflare 拦截了上传链路（403 challenge），这不是文件问题。")
+    print("请在浏览器窗口中完成验证（若有验证框请手动点一下）。")
+    print("脚本会暂停等待并自动重试，不会关闭窗口。")
+    print("!" * 70, flush=True)
+
+
+def _wait_upload_complete_networked(
+    page: Page,
+    scope: Any,
+    image_path: Path,
+    selectors: dict[str, list[dict[str, Any]]],
+    timeout_ms: int,
+    monitor: "NetworkMonitor",
+    security_timeout_ms: int = SECURITY_WAIT_MS,
+) -> str:
+    """Evidence-based upload completion check.
+
+    Stages (network evidence): transfer 2xx -> post-processing 2xx -> processed
+    asset 2xx. A UI toast alone is not sufficient to declare failure while one
+    of those requests is still in flight; a toast plus a rendered server preview
+    is success (Padlet occasionally shows the toast after storing the file).
+
+    A security check or a Cloudflare challenge pauses the wait so the user can
+    clear it in the visible browser; the window is never closed on the user.
+    """
+    started = time.monotonic()
+    deadline = started + timeout_ms / 1000
+    toast_since: Optional[float] = None
+    toast_message = ""
+    challenge_notices = 0
+
+    while time.monotonic() < deadline:
+        if _first_visible(page, selectors["security_text"]) is not None:
+            wait_out_security_check(page, selectors, security_timeout_ms, label="upload")
+            # The check can take a while; give the upload a fair chance after it.
+            deadline = max(deadline, time.monotonic() + 20)
+            toast_since = None
+
+        fatal = monitor.fatal_upload_status()
+        if fatal is not None:
+            if monitor.challenge_detected:
+                # A challenge is human-solvable, unlike a plain 403. Pause,
+                # let the user clear it, then give Padlet's client a retry.
+                if challenge_notices < 3:
+                    challenge_notices += 1
+                    _announce_challenge(fatal[0])
+                    wait_out_security_check(
+                        page, selectors, security_timeout_ms, label="upload (Cloudflare)"
+                    )
+                    page.wait_for_timeout(1500)
+                    monitor.clear_challenge_failure()
+                    toast_since = None
+                    deadline = max(deadline, time.monotonic() + 20)
+                    continue
+                raise UploadError(
+                    f"Cloudflare challenge kept blocking the {fatal[0]} request "
+                    f"({fatal[1]}); not bypassing it.",
+                    retryable=True,
+                )
+            _raise_for_upload_status(*fatal)
+
+        try:
+            src = scope.evaluate(_PREVIEW_SRC_JS)
+            uploading = scope.evaluate(_UPLOADING_JS)
+        except PWError:
+            src, uploading = None, False
+
+        # Success requires: a rendered preview, no spinner, the server accepted
+        # the bytes, and the preview URL is served by Padlet (not a blob/data
+        # URL from the local file).
+        if src and not uploading and monitor.upload_accepted and _is_server_asset(src):
+            if toast_since is not None:
+                logging.warning(
+                    "Padlet showed an upload-error toast, but the transfer and "
+                    "post-processing both succeeded; using the stored image."
+                )
+            logging.info("Image attached and preview rendered: %s", image_path.name)
+            return src
+
+        error = _first_visible(page, selectors["upload_error_text"])
+        if error is not None:
+            if toast_since is None:
+                toast_since = time.monotonic()
+                try:
+                    toast_message = error.inner_text().strip()[:160]
+                except PWError:
+                    toast_message = "upload error toast"
+            settled = not monitor.upload_inflight and not monitor.process_inflight
+            if settled and time.monotonic() - toast_since >= 5:
+                raise UploadError(f"Padlet reported an upload error: {toast_message}")
+        else:
+            toast_since = None
+
+        # A file handed to a not-yet-initialised uploader produces no request at
+        # all. That is a handoff failure, not a server failure, and is safe to
+        # retry because nothing was transferred.
+        if not monitor.upload_started and time.monotonic() - started >= 8:
+            raise UploadError(
+                "No upload request was observed after handing the file to Padlet "
+                "(the uploader may not have been ready)."
+            )
+
+        page.wait_for_timeout(250)
+
+    raise BotError(
+        f"Image upload did not finish within {timeout_ms // 1000}s for {image_path.name}. "
+        f"Last network state: upload={monitor.upload_responses[-2:]} "
+        f"process={monitor.process_responses[-2:]} assets={monitor.asset_responses[-2:]}"
+    )
+
+
 def wait_upload_complete(
     page: Page,
     scope: Any,
     image_path: Path,
     selectors: dict[str, list[dict[str, Any]]],
     timeout_ms: int = 60_000,
+    monitor: Optional["NetworkMonitor"] = None,
+    security_timeout_ms: int = SECURITY_WAIT_MS,
 ) -> str:
     """Wait for a rendered preview with no upload spinner; return its src.
 
-    Raises UploadError immediately when Padlet shows its upload-failure toast.
+    With a monitor this is an evidence-based state machine: only a server-hosted
+    preview combined with a 2xx transfer is success, and an HTTP/transport
+    failure on the transfer, post-processing or asset fetch is the failure.
+    Without one it falls back to the legacy UI-only check.
     """
+    if monitor is not None:
+        return _wait_upload_complete_networked(
+            page, scope, image_path, selectors, timeout_ms, monitor, security_timeout_ms
+        )
     deadline = time.monotonic() + timeout_ms / 1000
     while time.monotonic() < deadline:
+        if _first_visible(page, selectors["security_text"]) is not None:
+            wait_out_security_check(page, selectors, security_timeout_ms, label="upload")
+            deadline = max(deadline, time.monotonic() + 20)
         try:
             src = scope.evaluate(_PREVIEW_SRC_JS)
             uploading = scope.evaluate(_UPLOADING_JS)
@@ -615,6 +898,602 @@ def wait_upload_complete(
     raise BotError(f"Image upload did not finish within {timeout_ms // 1000}s for {image_path.name}.")
 
 
+# --------------------------------------------------------------------------- #
+# Upload diagnostics: network monitor + explicit state machine
+# --------------------------------------------------------------------------- #
+#
+# Design notes
+# ------------
+# * Every URL is reduced to ``scheme://host/path`` before it is written: query
+#   strings can carry signed tokens, so they are dropped entirely.
+# * Credential-bearing headers are redacted by name. Request bodies are never
+#   recorded (an upload body is the image itself).
+# * HTTP 4xx/5xx responses and transport-level ``requestfailed`` events are
+#   tracked separately: a 500 is a response, not a failed request, and a
+#   ``requestfailed`` says nothing about a status code.
+# * A rendered preview is *not* proof of success. READY additionally requires
+#   the server to have accepted the upload and the preview to be a server URL,
+#   so a local ``blob:``/``data:`` preview cannot be mistaken for success.
+
+_SENSITIVE_HEADERS = frozenset(
+    {"cookie", "set-cookie", "authorization", "proxy-authorization", "x-api-key", "x-csrf-token"}
+)
+
+UPLOAD_STATES = (
+    "SELECTED",
+    "UPLOADING",
+    "SERVER_ACCEPTED",
+    "PROCESSING",
+    "READY",
+    "FAILED",
+    "UNKNOWN",
+)
+
+
+def _sanitize_url(url: str) -> str:
+    """Return ``scheme://host/path`` with query string and fragment removed."""
+    try:
+        parts = urlparse(url)
+    except ValueError:
+        return url.split("?", 1)[0].split("#", 1)[0]
+    if not parts.scheme:
+        return url.split("?", 1)[0].split("#", 1)[0]
+    return f"{parts.scheme}://{parts.netloc}{parts.path}"
+
+
+def _redact_headers(headers: dict[str, str]) -> dict[str, str]:
+    return {
+        key: ("[redacted]" if key.lower() in _SENSITIVE_HEADERS else value)
+        for key, value in headers.items()
+    }
+
+
+def _classify_request(url: str) -> str:
+    """Coarse bucket used to tell file transfer apart from asset loading."""
+    try:
+        parts = urlparse(url)
+        host = parts.netloc.lower()
+        path = parts.path
+    except ValueError:
+        return "other"
+    if "padletcdn.com" in host or host.startswith("uploads-"):
+        return "upload"
+    # After the bytes are stored, Padlet asks its image service to finalise
+    # (resize/convert) the file. This is the step the ~80% marker refers to.
+    if "beethoven-v2/file" in path:
+        return "process"
+    if "padlet.pics" in host:
+        return "image_load"
+    if host.endswith("padlet.com") or host.endswith("padlet.org"):
+        return "api"
+    return "other"
+
+
+def _is_server_asset(src: Optional[str]) -> bool:
+    """True only for a preview served by Padlet's backend, not a local blob."""
+    if not src:
+        return False
+    try:
+        parts = urlparse(src)
+    except ValueError:
+        return False
+    if parts.scheme not in ("http", "https"):
+        return False
+    host = parts.netloc.lower()
+    return (
+        "padlet.pics" in host
+        or "padletcdn.com" in host
+        or "padlet.com" in host
+        or "googleusercontent.com" in host
+        or "storage.googleapis.com" in host
+    )
+
+
+class NetworkMonitor:
+    """Record upload-related network events to a JSONL file and summarise them.
+
+    Only xhr/fetch/image requests are recorded, plus any request to the upload
+    CDN regardless of its resource type (the transfer may be tagged ``other``
+    by the browser depending on how Padlet initiates it).
+    """
+
+    def __init__(self, page: Page, path: Path) -> None:
+        self.page = page
+        self.path = path
+        self._fh = path.open("w", encoding="utf-8")
+        self._started: dict[int, tuple[float, Any]] = {}
+
+        # Upload lifecycle
+        self.upload_started = False
+        self.upload_accepted = False
+        self.upload_rejected: Optional[Any] = None
+        self.upload_inflight = 0
+        self.upload_request: Optional[tuple[str, str]] = None
+        self.upload_responses: list[tuple[int, str]] = []
+
+        # Post-processing lifecycle (Padlet asks its image service to finalise)
+        self.process_started = False
+        self.process_ok = False
+        self.process_failed: Optional[Any] = None
+        self.process_inflight = 0
+        self.process_responses: list[tuple[int, str]] = []
+
+        # Asset lifecycle
+        self.image_load_ok = False
+        self.image_load_failed: Optional[Any] = None
+        self.asset_responses: list[tuple[int, str]] = []
+
+        # Other API traffic (upload_attributes, links, etc.)
+        self.api_responses: list[tuple[int, str]] = []
+
+        # Cloudflare challenge (403 + cf-mitigated: challenge). Not a normal
+        # permission error: a human can clear it, so callers pause instead of
+        # stopping the run.
+        self.challenge_detected = False
+        self.challenge_stage: Optional[str] = None
+
+        page.on("request", self._on_request)
+        page.on("response", self._on_response)
+        page.on("requestfailed", self._on_requestfailed)
+        page.on("pageerror", self._on_pageerror)
+
+    def reset_upload_tracking(self) -> None:
+        """Forget board-load traffic so only the upload itself is judged."""
+        self._started.clear()
+        self.upload_started = False
+        self.upload_accepted = False
+        self.upload_rejected = None
+        self.upload_inflight = 0
+        self.upload_request = None
+        self.upload_responses.clear()
+        self.process_started = False
+        self.process_ok = False
+        self.process_failed = None
+        self.process_inflight = 0
+        self.process_responses.clear()
+        self.image_load_ok = False
+        self.image_load_failed = None
+        self.asset_responses.clear()
+        self.api_responses.clear()
+        self.challenge_detected = False
+        self.challenge_stage = None
+
+    # -- recording -------------------------------------------------------- #
+
+    def _note_challenge(self, bucket: str, response: Any) -> None:
+        """Remember a Cloudflare challenge so callers can wait for a human.
+
+        A challenge is answered with 403 + ``cf-mitigated: challenge``. It is
+        not a permissions decision: clearing it in the visible browser is the
+        intended path, so this must not be treated as a permanent refusal.
+        """
+        try:
+            headers = dict(response.headers)
+        except PWError:
+            return
+        mitigated = next(
+            (str(v).lower() for k, v in headers.items() if k.lower() == "cf-mitigated"),
+            "",
+        )
+        if "challenge" in mitigated:
+            self.challenge_detected = True
+            self.challenge_stage = bucket
+
+    def clear_challenge_failure(self) -> None:
+        """Forget a challenge-caused failure so a later retry can succeed."""
+        if self.challenge_stage == "upload":
+            self.upload_rejected = None
+        elif self.challenge_stage == "process":
+            self.process_failed = None
+        elif self.challenge_stage == "image_load":
+            self.image_load_failed = None
+        self.challenge_detected = False
+        self.challenge_stage = None
+
+    def _write(self, record: dict[str, Any]) -> None:
+        record["ts"] = datetime.now().isoformat(timespec="milliseconds")
+        try:
+            self._fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            self._fh.flush()
+        except (OSError, ValueError):
+            pass
+
+    def _wanted(self, resource_type: str, bucket: str) -> bool:
+        return resource_type in ("xhr", "fetch", "image") or bucket in ("upload", "process")
+
+    # -- handlers --------------------------------------------------------- #
+
+    def _on_request(self, request: Any) -> None:
+        try:
+            url = request.url
+            bucket = _classify_request(url)
+            if not self._wanted(request.resource_type, bucket):
+                return
+            self._started[id(request)] = (time.monotonic(), request)
+            if bucket == "upload":
+                self.upload_started = True
+                self.upload_inflight += 1
+                if self.upload_request is None:
+                    self.upload_request = (request.method, _sanitize_url(url))
+            elif bucket == "process":
+                self.process_started = True
+                self.process_inflight += 1
+            self._write(
+                {
+                    "kind": "request",
+                    "method": request.method,
+                    "resource_type": request.resource_type,
+                    "class": bucket,
+                    "url": _sanitize_url(url),
+                }
+            )
+        except PWError:
+            pass
+
+    def _on_response(self, response: Any) -> None:
+        try:
+            request = response.request
+            url = response.url
+            bucket = _classify_request(url)
+            if not self._wanted(request.resource_type, bucket):
+                return
+            started = self._started.pop(id(request), None)
+            duration_ms = round((time.monotonic() - started[0]) * 1000, 1) if started else None
+            status = response.status
+            if status >= 400:
+                self._note_challenge(bucket, response)
+            record: dict[str, Any] = {
+                "kind": "response",
+                "method": request.method,
+                "resource_type": request.resource_type,
+                "class": bucket,
+                "url": _sanitize_url(url),
+                "status": status,
+                "duration_ms": duration_ms,
+            }
+            if bucket == "upload":
+                self.upload_inflight = max(0, self.upload_inflight - 1)
+                self.upload_responses.append((status, _sanitize_url(url)))
+                if 200 <= status < 300:
+                    self.upload_accepted = True
+                elif status >= 400:
+                    self.upload_rejected = status
+                    try:
+                        record["headers"] = _redact_headers(dict(response.headers))
+                    except PWError:
+                        pass
+                    try:
+                        record["body"] = response.text()[:600]
+                    except PWError:
+                        pass
+            elif bucket == "process":
+                self.process_inflight = max(0, self.process_inflight - 1)
+                self.process_responses.append((status, _sanitize_url(url)))
+                if 200 <= status < 300:
+                    self.process_ok = True
+                elif status >= 400:
+                    self.process_failed = status
+                    try:
+                        record["headers"] = _redact_headers(dict(response.headers))
+                    except PWError:
+                        pass
+                    try:
+                        record["body"] = response.text()[:600]
+                    except PWError:
+                        pass
+            elif bucket == "image_load":
+                self.asset_responses.append((status, _sanitize_url(url)))
+                if 200 <= status < 300:
+                    self.image_load_ok = True
+                elif status >= 400:
+                    self.image_load_failed = status
+            elif bucket == "api":
+                self.api_responses.append((status, _sanitize_url(url)))
+            self._write(record)
+        except PWError:
+            pass
+
+    def _on_requestfailed(self, request: Any) -> None:
+        try:
+            url = request.url
+            bucket = _classify_request(url)
+            if not self._wanted(request.resource_type, bucket):
+                return
+            self._started.pop(id(request), None)
+            failure = request.failure or "unknown"
+            if bucket == "upload":
+                self.upload_inflight = max(0, self.upload_inflight - 1)
+                if self.upload_rejected is None:
+                    self.upload_rejected = f"requestfailed: {failure}"
+            elif bucket == "process":
+                self.process_inflight = max(0, self.process_inflight - 1)
+                if self.process_failed is None:
+                    self.process_failed = f"requestfailed: {failure}"
+            elif bucket == "image_load":
+                if self.image_load_failed is None:
+                    self.image_load_failed = f"requestfailed: {failure}"
+            self._write(
+                {
+                    "kind": "requestfailed",
+                    "method": request.method,
+                    "resource_type": request.resource_type,
+                    "class": bucket,
+                    "url": _sanitize_url(url),
+                    "failure": failure,
+                }
+            )
+        except PWError:
+            pass
+
+    def _on_pageerror(self, error: Any) -> None:
+        self._write({"kind": "pageerror", "error": str(error)[:300]})
+
+    # -- reporting -------------------------------------------------------- #
+
+    def upload_request_line(self) -> str:
+        if not self.upload_request:
+            return "not observed"
+        return f"{self.upload_request[0]} {self.upload_request[1]}"
+
+    def upload_response_line(self) -> str:
+        if not self.upload_responses:
+            return "not observed"
+        status, url = self.upload_responses[-1]
+        return f"{status} {url}"
+
+    def fatal_upload_status(self) -> Optional[tuple[str, Any]]:
+        """First conclusive upload-side failure, as ``(stage, status)``."""
+        if self.upload_rejected is not None:
+            return "file transfer", self.upload_rejected
+        if self.process_failed is not None:
+            return "image post-processing", self.process_failed
+        if self.upload_accepted and self.image_load_failed is not None:
+            return "image asset", self.image_load_failed
+        return None
+
+    def processing_line(self) -> str:
+        if self.process_responses:
+            recent = self.process_responses[-3:]
+            return "; ".join(f"{status} {url}" for status, url in recent)
+        if not self.api_responses:
+            return "no image-processing/API request observed"
+        recent = self.api_responses[-3:]
+        return "; ".join(f"{status} {url}" for status, url in recent)
+
+    def loading_line(self) -> str:
+        if not self.asset_responses:
+            return "no image resource request observed"
+        recent = self.asset_responses[-3:]
+        return "; ".join(f"{status} {url}" for status, url in recent)
+
+    def close(self) -> None:
+        try:
+            self._fh.close()
+        except OSError:
+            pass
+
+
+# One evaluate() for preview, progress state and progress value: fewer round
+# trips means the sampled UI state is internally consistent.
+_UPLOAD_UI_JS = r"""
+(root) => {
+  const imgs = [...root.querySelectorAll('img')]
+    .filter(i => i.naturalWidth > 0 && i.offsetWidth >= 40 && i.offsetHeight >= 40);
+  imgs.sort((a, b) => (b.offsetWidth * b.offsetHeight) - (a.offsetWidth * a.offsetHeight));
+  const bars = [...document.querySelectorAll('[role="progressbar"],[aria-valuenow]')]
+    .filter(e => e.offsetWidth > 0)
+    .map(e => e.getAttribute('aria-valuenow'));
+  const text = (root.innerText || '').slice(0, 4000);
+  const pct = text.match(/(\d{1,3})\s*%/);
+  return {
+    src: imgs.length ? imgs[0].src : null,
+    natural: imgs.length ? [imgs[0].naturalWidth, imgs[0].naturalHeight] : null,
+    uploading: /(uploading|processing|please wait)/i.test(text),
+    bars: bars,
+    pct: pct ? Number(pct[1]) : null,
+  };
+}
+"""
+
+
+def track_upload_state(
+    page: Page,
+    scope: Locator,
+    monitor: NetworkMonitor,
+    selectors: dict[str, list[dict[str, Any]]],
+    timeout_s: float = 90.0,
+    security_timeout_ms: int = SECURITY_WAIT_MS,
+) -> tuple[str, str, list[tuple[str, str]]]:
+    """Follow SELECTED -> ... -> READY/FAILED using network + UI evidence.
+
+    Returns ``(final_state, reason, history)``. Evidence is evaluated in this
+    order, deliberately: an explicit error wins over anything else; a network
+    failure of the transfer or of the asset beats a rendered preview; READY
+    needs both a server-accepted upload and a server-hosted rendered image.
+    If nothing conclusive is observed before the deadline the result is
+    ``UNKNOWN`` -- never an assumed success.
+    """
+
+    history: list[tuple[str, str]] = []
+    state = "SELECTED"
+    reason = "file handed to the upload control"
+    history.append((state, reason))
+    deadline = time.monotonic() + timeout_s
+
+    while time.monotonic() < deadline:
+        if _first_visible(page, selectors["security_text"]) is not None:
+            # Diagnostics also pause instead of closing the window on the user.
+            wait_out_security_check(page, selectors, security_timeout_ms, label="upload diagnostics")
+            deadline = max(deadline, time.monotonic() + 20)
+
+        try:
+            ui = scope.evaluate(_UPLOAD_UI_JS)
+        except PWError:
+            ui = {"src": None, "uploading": False, "bars": [], "pct": None}
+
+        err_text = ""
+        error = _first_visible(page, selectors["upload_error_text"])
+        if error is not None:
+            try:
+                err_text = error.inner_text().strip()[:200]
+            except PWError:
+                err_text = "upload error toast"
+
+        progress_note = ""
+        if ui.get("pct") is not None:
+            progress_note += f"; UI progress {ui['pct']}%"
+        if ui.get("bars"):
+            progress_note += f"; progressbar={ui['bars']}"
+        challenge_note = ""
+        if monitor.challenge_detected:
+            challenge_note = (
+                f"; CF challenge on the {monitor.challenge_stage or 'upload'} request"
+                " (403 cf-mitigated: challenge) — clear it in the browser"
+            )
+
+        if err_text:
+            new_state, why = "FAILED", f"UI error message: {err_text}{progress_note}{challenge_note}"
+        elif monitor.upload_rejected is not None:
+            new_state, why = (
+                "FAILED",
+                f"upload request did not succeed: {monitor.upload_rejected}"
+                f"{progress_note}{challenge_note}",
+            )
+        elif monitor.process_failed is not None:
+            new_state, why = (
+                "FAILED",
+                f"image post-processing request failed: {monitor.process_failed}"
+                f"{progress_note}{challenge_note}",
+            )
+        elif monitor.upload_accepted and monitor.image_load_failed is not None:
+            new_state, why = (
+                "FAILED",
+                f"image resource failed to load: {monitor.image_load_failed}{progress_note}",
+            )
+        elif ui.get("src") and not ui.get("uploading") and monitor.upload_accepted and _is_server_asset(ui["src"]):
+            new_state, why = "READY", "server accepted the upload and the server-hosted preview is rendered"
+        elif monitor.upload_accepted and (monitor.upload_inflight or monitor.process_inflight):
+            new_state, why = "SERVER_ACCEPTED", "a 2xx upload response arrived; a transfer is still in flight"
+        elif monitor.upload_accepted:
+            new_state, why = "PROCESSING", "upload accepted by the server; waiting for the processed asset"
+        elif monitor.upload_started:
+            new_state, why = "UPLOADING", "the upload request is in flight"
+        else:
+            new_state, why = "SELECTED", "waiting for the upload request to appear"
+
+        if new_state != state:
+            state, reason = new_state, why
+            history.append((state, reason))
+        if state in ("READY", "FAILED"):
+            break
+        page.wait_for_timeout(300)
+    else:
+        if state not in ("READY", "FAILED"):
+            state = "UNKNOWN"
+            reason = "timeout without conclusive network or UI evidence"
+            history.append((state, reason))
+
+    return state, reason, history
+
+
+def diagnose_upload(
+    url: str,
+    image_path: Optional[str] = None,
+    headless: bool = False,
+    timeout_s: float = 90.0,
+    profile_dir: Optional[Path] = CHROME_PROFILE_DIR,
+    security_timeout_ms: int = SECURITY_WAIT_MS,
+) -> int:
+    """Single-attempt upload diagnostic. Never publishes and never retries.
+
+    The editor is left open at the end (the browser closes, so nothing is
+    submitted) and the failure scene is preserved as a screenshot plus DOM.
+    """
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    selectors = load_selectors()
+    if image_path:
+        image = Path(image_path).expanduser()
+    else:
+        image = random.choice(load_images())
+    if not image.is_file():
+        raise BotError(f"Image not found: {image}")
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    net_path = LOGS_DIR / f"upload_network_{stamp}.jsonl"
+    report_path = LOGS_DIR / f"upload_debug_{stamp}.txt"
+    shot_path = LOGS_DIR / f"upload_debug_{stamp}.png"
+    dom_path = LOGS_DIR / f"upload_debug_{stamp}.html"
+
+    lines: list[str] = []
+
+    def emit(text: str = "") -> None:
+        print(text)
+        lines.append(text)
+
+    final_state = "UNKNOWN"
+    final_reason = "diagnostic did not reach the upload tracking stage"
+    history: list[tuple[str, str]] = []
+
+    with sync_playwright() as pw:
+        session = launch_browser(pw, headless, profile_dir)
+        page = session.page
+        monitor = NetworkMonitor(page, net_path)
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+            wait_for_board(page, selectors, security_timeout_ms=security_timeout_ms)
+            check_not_logged_in(page, selectors)
+            column = random.choice(get_columns(page, selectors))
+            composer = open_editor(page, column, selectors)
+            # The board's own thumbnails/avatars are not part of this upload.
+            monitor.reset_upload_tracking()
+            emit(f"Column: {column.title}")
+            emit(f"Upload selected: {image.name} ({image.stat().st_size} bytes)")
+            try:
+                _attach_file(page, composer, image, selectors)
+            except (SelectorError, PWError) as exc:
+                final_state = "FAILED"
+                final_reason = f"could not hand the file to the upload control: {exc}"
+            else:
+                final_state, final_reason, history = track_upload_state(
+                    page, composer, monitor, selectors, timeout_s=timeout_s,
+                    security_timeout_ms=security_timeout_ms,
+                )
+        except (BotError, PWError) as exc:
+            final_state = "UNKNOWN"
+            final_reason = f"diagnostic error before a conclusive upload state: {exc}"
+        finally:
+            try:
+                page.screenshot(path=str(shot_path), full_page=True)
+            except PWError:
+                pass
+            try:
+                dom_path.write_text(page.content(), encoding="utf-8")
+            except PWError:
+                pass
+            monitor.close()
+            session.close()
+
+            if history:
+                emit("State transitions:")
+                for name, why in history:
+                    emit(f"  {name}: {why}")
+            emit(f"Upload request: {monitor.upload_request_line()}")
+            emit(f"Upload response: {monitor.upload_response_line()}")
+            emit(f"Image processing: {monitor.processing_line()}")
+            emit(f"Image loading: {monitor.loading_line()}")
+            emit(f"Final status: {final_state}")
+            emit(f"Reason: {final_reason}")
+            emit(f"Network log: {net_path}")
+            emit(f"Screenshot: {shot_path}")
+            emit(f"DOM: {dom_path}")
+            try:
+                report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            except OSError:
+                pass
+
+    return 0 if final_state == "READY" else 1
+
+
 def close_editor(page: Page, selectors: dict[str, list[dict[str, Any]]]) -> None:
     """Best-effort discard of an unsubmitted editor (dry run)."""
     for key in ("cancel_button",):
@@ -647,15 +1526,23 @@ def publish_post(
     image_path: Path,
     alias: str,
     selectors: dict[str, list[dict[str, Any]]],
+    monitor: Optional["NetworkMonitor"] = None,
+    security_timeout_ms: int = SECURITY_WAIT_MS,
 ) -> str:
     """Open composer -> upload -> submit -> verify. Returns a status constant."""
     open_editor(page, column, selectors)
     editor = resolve(page, "editor", selectors, timeout_ms=5_000)
-    upload_image(page, image_path, selectors)
+    upload_image(
+        page, image_path, selectors, monitor=monitor,
+        security_timeout_ms=security_timeout_ms,
+    )
     before_posts = _count_post_cards(page, selectors)
 
     resolve(page, "publish_button", selectors, timeout_ms=8_000).click()
-    return verify_post(page, column, editor, before_posts, alias, selectors)
+    return verify_post(
+        page, column, editor, before_posts, alias, selectors,
+        security_timeout_ms=security_timeout_ms,
+    )
 
 
 _POST_IN_COLUMN_JS = r"""
@@ -688,16 +1575,21 @@ def verify_post(
     before_posts: int,
     alias: str,
     selectors: dict[str, list[dict[str, Any]]],
+    security_timeout_ms: int = SECURITY_WAIT_MS,
 ) -> str:
     """Return published / pending_moderation / failed / uncertain.
 
     Success requires the composer to close *and* the uploaded image to be visible
     in the target column. Anything less is ``uncertain`` -- never assumed success.
+    A security check pauses the verification so the user can clear it.
     """
     # 1) Editor should close.
     editor_closed = False
     deadline = time.monotonic() + 20
     while time.monotonic() < deadline:
+        if _first_visible(page, selectors["security_text"]) is not None:
+            wait_out_security_check(page, selectors, security_timeout_ms, label="publish")
+            deadline = max(deadline, time.monotonic() + 20)
         try:
             if not editor.is_visible():
                 editor_closed = True
@@ -708,9 +1600,6 @@ def verify_post(
         page.wait_for_timeout(200)
 
     # 2) Explicit signals win over inference.
-    if exists(page, "security_text", selectors):
-        raise StopRun("Security check / captcha appeared during publish. Stopped.")
-
     toast = _toast_text(page, selectors)
     if toast.startswith("moderation_text"):
         return STATUS_PENDING
@@ -728,6 +1617,9 @@ def verify_post(
     #    page-wide post-card count.
     deadline = time.monotonic() + 20
     while time.monotonic() < deadline:
+        if _first_visible(page, selectors["security_text"]) is not None:
+            wait_out_security_check(page, selectors, security_timeout_ms, label="publish confirmation")
+            deadline = max(deadline, time.monotonic() + 20)
         try:
             if page.evaluate(_POST_IN_COLUMN_JS, [column.title, alias]):
                 return STATUS_PUBLISHED
@@ -873,6 +1765,8 @@ def run(
     alias: Optional[str] = None,
     interval: float = MIN_INTERVAL_S,
     diagnose_only: bool = False,
+    profile_dir: Optional[Path] = CHROME_PROFILE_DIR,
+    security_timeout_ms: int = SECURITY_WAIT_MS,
 ) -> Stats:
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     selectors = load_selectors()
@@ -887,13 +1781,14 @@ def run(
     run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        context = browser.new_context()
-        page = context.new_page()
+        session = launch_browser(p, headless, profile_dir)
+        page = session.page
+        monitor = NetworkMonitor(page, LOGS_DIR / f"upload_network_{run_stamp}.jsonl")
+        logging.info("Upload network log: %s", monitor.path)
 
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-            wait_for_board(page, selectors)
+            wait_for_board(page, selectors, security_timeout_ms=security_timeout_ms)
 
             if diagnose_only:
                 report = diagnose(page, selectors, LOGS_DIR)
@@ -919,12 +1814,18 @@ def run(
 
                     if dry_run:
                         open_editor(page, column, selectors)
-                        upload_image(page, image, selectors)
+                        upload_image(
+                            page, image, selectors, monitor=monitor,
+                            security_timeout_ms=security_timeout_ms,
+                        )
                         close_editor(page, selectors)
                         status = STATUS_DRY_RUN
                         detail = "image attached in editor; not published"
                     else:
-                        status = publish_post(page, column, image, fixed_alias, selectors)
+                        status = publish_post(
+                            page, column, image, fixed_alias, selectors, monitor=monitor,
+                            security_timeout_ms=security_timeout_ms,
+                        )
                 except StopRun:
                     raise
                 except (BotError, PWError) as exc:
@@ -965,11 +1866,8 @@ def run(
                     page.wait_for_timeout(int(interval * 1000))
 
         finally:
-            try:
-                context.close()
-                browser.close()
-            except PWError:
-                pass
+            monitor.close()
+            session.close()
 
     csv_path = _write_csv(stats, run_stamp)
     if dry_run:
@@ -1029,14 +1927,52 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--headless", action="store_true", help="Run without a visible browser")
     parser.add_argument("--dry-run", action="store_true", help="Upload only; never publish")
     parser.add_argument("--diagnose", action="store_true", help="Dump selectors and exit; no posting")
+    parser.add_argument(
+        "--upload-debug",
+        action="store_true",
+        help="Single-attempt upload diagnosis: no publish, no retry, network log + screenshot",
+    )
+    parser.add_argument("--image", help="Image to use with --upload-debug (default: random from images/)")
+    parser.add_argument(
+        "--upload-timeout",
+        type=float,
+        default=90.0,
+        help="Seconds to observe one upload in --upload-debug before reporting UNKNOWN",
+    )
     parser.add_argument("--interval", type=float, default=MIN_INTERVAL_S, help="Seconds between posts")
+    parser.add_argument(
+        "--security-timeout",
+        type=float,
+        default=0.0,
+        help="Seconds to wait for you to clear a security check (0 = wait forever; window stays open)",
+    )
     parser.add_argument("--yes", action="store_true", help="Skip the >%d confirmation" % CONFIRM_THRESHOLD)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
 
     setup_logging(args.verbose)
+    security_timeout_ms = int(max(0.0, args.security_timeout) * 1000)
 
     url = args.url or _prompt_url()
+
+    if args.upload_debug:
+        try:
+            return diagnose_upload(
+                url,
+                image_path=args.image,
+                headless=args.headless,
+                timeout_s=args.upload_timeout,
+                security_timeout_ms=security_timeout_ms,
+            )
+        except StopRun as exc:
+            logging.error("Stopped: %s", exc)
+            print(f"\nSTOPPED: {exc}")
+            return 3
+        except BotError as exc:
+            logging.error("Aborted: %s", exc)
+            print(f"\nABORTED: {exc}")
+            return 2
+
     count = args.count if args.count is not None else _prompt_count()
 
     if count < 1:
@@ -1060,6 +1996,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             alias=args.alias,
             interval=args.interval,
             diagnose_only=args.diagnose,
+            security_timeout_ms=security_timeout_ms,
         )
     except StopRun as exc:
         logging.error("Stopped: %s", exc)
