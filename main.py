@@ -202,6 +202,10 @@ class StopRun(Exception):
     """A condition that must abort the whole run (captcha, rate limit, ...)."""
 
 
+class AliasNotRenamable(BotError):
+    """The visitor menu has no 'Change name' entry; keep the existing name."""
+
+
 @dataclass
 class BrowserSession:
     """A launched browser plus the page to drive, and how to close both.
@@ -531,7 +535,7 @@ def _open_change_name(page: Page, selectors: dict[str, list[dict[str, Any]]]) ->
         change = resolve(page, "guest_menu_item_change_name", selectors, timeout_ms=5000)
     except SelectorError as exc:
         page.keyboard.press("Escape")
-        raise BotError(
+        raise AliasNotRenamable(
             "'Change name' was not available in the visitor menu. The board may "
             "forbid anonymous renaming, or this is not a guest session."
         ) from exc
@@ -543,6 +547,10 @@ def _open_change_name(page: Page, selectors: dict[str, list[dict[str, Any]]]) ->
 def set_guest_alias(page: Page, name: str, selectors: dict[str, list[dict[str, Any]]]) -> None:
     """Set the fixed guest alias once and verify it persisted.
 
+    If the board does not offer 'Change name', the run continues with whatever
+    guest name the board already assigned instead of aborting: the board just
+    needs one consistent name, not necessarily ours.
+
     Verification reopens the 'Change name' dialog and reads the stored value --
     stronger than checking the avatar, since Padlet renders the avatar as an
     image with no text.
@@ -550,7 +558,15 @@ def set_guest_alias(page: Page, name: str, selectors: dict[str, list[dict[str, A
     if not name.strip():
         raise BotError("Alias must not be empty.")
 
-    avatar, field = _open_change_name(page, selectors)
+    try:
+        avatar, field = _open_change_name(page, selectors)
+    except AliasNotRenamable as exc:
+        logging.warning("Skipping alias change: %s", exc)
+        print(
+            "访客菜单里没有 'Change name'，跳过改名，沿用当前昵称继续。",
+            flush=True,
+        )
+        return
     field.fill(name)
     resolve(page, "name_save", selectors, timeout_ms=5000).click()
 

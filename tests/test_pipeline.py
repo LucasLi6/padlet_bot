@@ -151,6 +151,16 @@ def test_set_guest_alias_verifies(run_env):
         pw.stop()
 
 
+def test_set_guest_alias_skips_when_renaming_is_forbidden(monkeypatch):
+    """No 'Change name' entry is not fatal: keep the board's existing name."""
+
+    def no_menu(page, selectors):
+        raise main.AliasNotRenamable("menu item missing")
+
+    monkeypatch.setattr(main, "_open_change_name", no_menu)
+    main.set_guest_alias(object(), "TestBot", SELECTORS)  # must not raise
+
+
 def test_publishes_requested_count(run_env, mock_network):
     stats = main.run(MOCK, 3, headless=True, alias="Tester", interval=0.01, profile_dir=None)
     assert stats.requested == 3
